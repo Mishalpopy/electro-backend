@@ -8,6 +8,7 @@ router.get('/', productController.getProducts);
 router.get('/popular-searches', productController.getPopularSearches);
 router.post('/', protect, admin, productController.createProduct);
 router.post('/bulk', protect, admin, excelUpload.array('files', 50), productController.bulkUploadProducts);
+router.post('/clear-all', protect, admin, productController.clearAllData);
 router.put('/:id', protect, admin, productController.updateProduct);
 router.delete('/:id', protect, admin, productController.deleteProduct);
 

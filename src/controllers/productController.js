@@ -487,6 +487,32 @@ const getPopularSearches = async (req, res) => {
     }
 };
 
+const clearAllData = async (req, res) => {
+    try {
+        console.log('[Clear All] Clearing products...');
+        await Product.deleteMany({});
+
+        console.log('[Clear All] Clearing brands...');
+        await Brand.deleteMany({});
+
+        console.log('[Clear All] Resetting counters...');
+        const Counter = require('../models/CounterModel');
+        await Counter.deleteMany({ id: { $in: ['product_id', 'brand_id'] } });
+
+        console.log('[Clear All] Running auto-seeding...');
+        const autoSeed = require('../config/autoSeed');
+        await autoSeed();
+
+        res.status(200).json({
+            status: true,
+            message: 'All products and custom brands cleared, default seeds re-applied successfully.'
+        });
+    } catch (error) {
+        console.error('[Clear All] Error:', error.message);
+        res.status(500).json({ status: false, message: error.message });
+    }
+};
+
 module.exports = {
     getProducts,
     createProduct,
@@ -494,4 +520,5 @@ module.exports = {
     updateProduct,
     deleteProduct,
     getPopularSearches,
+    clearAllData,
 };
