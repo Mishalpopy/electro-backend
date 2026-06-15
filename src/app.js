@@ -18,17 +18,18 @@ const userVehicleRoutes = require('./routes/userVehicleRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 
 
-const app = express();
 
+
+const app = express();
 // Middleware
 app.use(cors({
     origin: (origin, callback) => {
         const allowedOrigins = [
-            'http://localhost:5173', 
+            'http://localhost:5173',
             'http://localhost:3000',
             'https://admin-electro-electro.up.railway.app'
         ];
-        
+
         // Allow mobile apps (no origin) or specific allowed origins
         if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.up.railway.app')) {
             callback(null, true);
