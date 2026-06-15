@@ -105,15 +105,116 @@ const mapRowToProduct = (row) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // PDF Extractor — tuned for Energizer Product Sheet format
 // ─────────────────────────────────────────────────────────────────────────────
-const extractFromPDF = async (buffer) => {
+const extractFromPDF = async (buffer, filename = '') => {
     console.log('[PDF] Starting extraction, buffer size:', buffer.length);
     const data = await pdfParse(buffer);
     const fullText = data.text;
-    console.log('[PDF] Full extracted text:\n', fullText);
+    console.log('[PDF] Full extracted text length:', fullText.length);
 
     const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
     console.log('[PDF] Total lines:', lines.length);
 
+    // ── Strategy 1b: Two-line layout (Line 1: PartNumber + Brand + AH, Line 2: Price) ──
+    const products = [];
+    const listWarranty = fullText.match(/(\d+)\s*Month\s*Warranty/i)?.[0] || '12 Month Warranty';
+    
+    let filenameBrand = '';
+    if (filename) {
+        const cleanFn = filename.replace(/\.[^/.]+$/, ""); // strip extension
+        const fnParts = cleanFn.split(/_| - /);
+        for (const part of fnParts) {
+            const p = part.trim().replace(/[^a-zA-Z0-9]/g, '');
+            if (p && /^(Solite|Energizer|Bosch|Exide|Varta|Amaron|Hella|Yuasa|Delkor|ACDelco|Panasonic|Sebang|Asimco)$/i.test(p)) {
+                filenameBrand = part.trim().replace(/[®™]/g, '');
+                break;
+            }
+        }
+        if (!filenameBrand) {
+            const match = cleanFn.match(/^([a-zA-Z0-9]{3,20})/);
+            if (match && !/^(Product|Sheet|Catalogue|Price|List|Updated|Draft|Copy)$/i.test(match[1])) {
+                filenameBrand = match[1];
+            }
+        }
+    }
+
+    let textBrand = '';
+    const brandSymbolMatch = fullText.match(/\b([A-Za-z0-9\-]{3,20})\s*[®™]/);
+    if (brandSymbolMatch) {
+        textBrand = brandSymbolMatch[1];
+    }
+
+    const brandPatterns = ['Solite', 'Energizer', 'Bosch', 'Exide', 'Varta', 'Amaron', 'Hella', 'Yuasa', 'Delkor', 'ACDelco', 'Sebang', 'Asimco'];
+    if (filenameBrand && !brandPatterns.map(b => b.toLowerCase()).includes(filenameBrand.toLowerCase())) {
+        brandPatterns.push(filenameBrand);
+    }
+    if (textBrand && !brandPatterns.map(b => b.toLowerCase()).includes(textBrand.toLowerCase())) {
+        brandPatterns.push(textBrand);
+    }
+
+    for (let i = 0; i < lines.length - 1; i++) {
+        const line = lines[i];
+        const nextLine = lines[i + 1];
+
+        const priceMatch = nextLine.match(/^\d+(?:\.\d{2})?\s*$/);
+        if (!priceMatch) continue;
+
+        let foundBrand = '';
+        for (const bp of brandPatterns) {
+            if (line.toLowerCase().includes(bp.toLowerCase())) {
+                foundBrand = bp;
+                break;
+            }
+        }
+
+        if (foundBrand) {
+            const brandIdx = line.toLowerCase().indexOf(foundBrand.toLowerCase());
+            const partNumRaw = line.substring(0, brandIdx).trim();
+            const afterBrandRaw = line.substring(brandIdx + foundBrand.length).trim();
+
+            if (partNumRaw.length >= 3) {
+                const productPrice = parseFloat(nextLine);
+                
+                let ah = '-';
+                const ahMatch = afterBrandRaw.match(/(\d+)\s*AH/i);
+                if (ahMatch) {
+                    ah = `${ahMatch[1]} Ah`;
+                }
+
+                let cca = '-';
+                const ccaMatch = afterBrandRaw.match(/(\d+)\s*CCA/i);
+                if (ccaMatch) {
+                    cca = `${ccaMatch[1]} A`;
+                }
+
+                const mappedProduct = {
+                    brand: foundBrand,
+                    part_number: partNumRaw,
+                    name: `${foundBrand} ${partNumRaw}`,
+                    ah: ah,
+                    capacity: ah !== '-' ? ah : (afterBrandRaw || '-'),
+                    cca: cca,
+                    price: productPrice,
+                    warranty: listWarranty,
+                    voltage: '12 V',
+                    battery_type: partNumRaw.startsWith('CMF') ? 'Flooded / CMF' : 'Flooded / SLI',
+                    description: `${foundBrand} Battery | Part: ${partNumRaw} | Capacity: ${afterBrandRaw || ah}`,
+                    stock_status: 'In Stock',
+                    type: 'battery',
+                    image: BATTERY_ICON,
+                    images: []
+                };
+
+                products.push(mappedProduct);
+            }
+        }
+    }
+
+    if (products.length > 0) {
+        console.log(`[PDF] Two-line layout matched! Extracted ${products.length} products.`);
+        return products;
+    }
+
+    // ── Fallback to original Energizer / generic strategies ──
     const product = {};
 
     // ── Strategy 1: Table mode (header row with 2+ field aliases) ────────────
@@ -133,7 +234,7 @@ const extractFromPDF = async (buffer) => {
     }
 
     if (headerLineIdx >= 0 && headerFields.length >= 2) {
-        const products = [];
+        const tableProducts = [];
         for (let i = headerLineIdx + 1; i < lines.length; i++) {
             const cells = lines[i].split(/\t| {3,}|\|/).map(p => p.trim()).filter(Boolean);
             if (cells.length < 2) continue;
@@ -141,26 +242,13 @@ const extractFromPDF = async (buffer) => {
             headerFields.forEach((field, idx) => {
                 if (field && cells[idx] !== undefined) row[field] = cells[idx];
             });
-            products.push(mapRowToProduct(row));
+            tableProducts.push(mapRowToProduct(row));
         }
-        console.log('[PDF] Table mode: extracted', products.length, 'products');
-        if (products.length > 0) return products;
+        console.log('[PDF] Table mode: extracted', tableProducts.length, 'products');
+        if (tableProducts.length > 0) return tableProducts;
     }
 
     // ── Strategy 2: Energizer product sheet fixed value-sequence ─────────────
-    // After the "I I I" separator, values appear in this fixed order:
-    //  [0]  Short code (EP60JXH)                 → part_number
-    //  [1]  HS Code (85071020)                    → skip
-    //  [2]  SAP EAN (679741)                      → skip
-    //  [3]  Barcode EAN (4016987155196)            → skip
-    //  [4]  Equivalent part (MF55D23R)            → description
-    //  [5]  Label Short Code (EP60JX)             → name
-    //  [6]  Charge Eye (Yes/No)                   → skip
-    //  [7]  Voltage (12 V)                        → voltage
-    //  [8]  Capacity (60 Ah)                      → ah + capacity
-    //  [9]  Reserve Capacity (90 Min)             → skip
-    //  [10] CCA (440 A)                           → cca
-    //  [11] Acid gravity (1,28)                   → skip
     const separatorIdx = lines.findIndex(l => /^I\s+I\s+I/.test(l));
     console.log('[PDF] Separator "I I I" at line index:', separatorIdx);
 
@@ -170,24 +258,21 @@ const extractFromPDF = async (buffer) => {
             'General', 'Container', 'Terminal', 'Transportation', 'Layout', 'BASE', 'Short code'];
         const valueLines = afterSep.filter(l =>
             !SKIP_STARTS.some(s => l.startsWith(s)) &&
-            l.length < 120   // exclude long copyright/disclaimer lines
+            l.length < 120
         );
         console.log('[PDF] Value lines after separator:', JSON.stringify(valueLines));
 
-        if (valueLines[0])  product.part_number = valueLines[0];   // EP60JXH
-        if (valueLines[4])  product.description  = valueLines[4];  // MF55D23R (equivalent)
-        if (valueLines[5])  product.name         = valueLines[5];  // EP60JX (label/model)
-        // [6] = Charge Eye (Yes/No) — skip
-        if (valueLines[7])  product.voltage      = valueLines[7];  // 12 V
-        if (valueLines[8])  { product.ah = valueLines[8]; product.capacity = valueLines[8]; } // 60 Ah
-        // [9] = Reserve Capacity (Min) — skip
-        if (valueLines[10]) product.cca          = valueLines[10]; // 440 A
+        if (valueLines[0])  product.part_number = valueLines[0];
+        if (valueLines[4])  product.description  = valueLines[4];
+        if (valueLines[5])  product.name         = valueLines[5];
+        if (valueLines[7])  product.voltage      = valueLines[7];
+        if (valueLines[8])  { product.ah = valueLines[8]; product.capacity = valueLines[8]; }
+        if (valueLines[10]) product.cca          = valueLines[10];
 
         console.log('[PDF] Sequence mapping result:', product);
     }
 
     // ── Strategy 3: Dimension extraction from top section ────────────────────
-    // "Max Length (L)232 mm", "Max Width (W)173 mm", "Max Height  (H) 225 mm"
     const lenMatch = fullText.match(/Max Length\s*\([^)]*\)\s*([\d,.]+)\s*mm/i);
     const widMatch = fullText.match(/Max Width\s*\([^)]*\)\s*([\d,.]+)\s*mm/i);
     const hgtMatch = fullText.match(/Max Height\s*[^\d]*([\d,.]+)\s*mm/i);
@@ -197,7 +282,6 @@ const extractFromPDF = async (buffer) => {
     }
 
     // ── Strategy 4: Technology line → battery_type ───────────────────────────
-    // "TechnologyFlooded / SLIType of Terminal..."
     const techMatch = fullText.match(/Technology\s*([\w\/\s]+?)(?:Type of Terminal|Alloy|$)/i);
     if (techMatch) {
         product.battery_type = techMatch[1].trim();
@@ -213,14 +297,14 @@ const extractFromPDF = async (buffer) => {
         }
     }
 
-    // ── Build full product name: "Energizer EP60JX" ──────────────────────────
+    // ── Build name ──
     if (product.brand && product.name && !product.name.includes(product.brand)) {
         product.name = `${product.brand} ${product.name}`;
     } else if (product.brand && !product.name && product.part_number) {
         product.name = `${product.brand} ${product.part_number}`;
     }
 
-    // ── Build description from specs if equivalent part is a short code ───────
+    // ── Build description ──
     const descIsShortCode = product.description && /^[A-Z0-9\-\/]{3,15}$/.test(product.description.trim());
     if (descIsShortCode || !product.description) {
         const equivalent = product.description || '';
@@ -241,7 +325,6 @@ const extractFromPDF = async (buffer) => {
     if (!product.cca)      { const m = fullText.match(/(\d{3,})\s*A\b/); if (m) product.cca      = `${m[1]} A`; }
     if (!product.capacity) product.capacity = product.ah || '-';
 
-    console.log('[PDF] Final fields found:', Object.keys(product).filter(k => product[k]));
     console.log('[PDF] Final product:', JSON.stringify(product, null, 2));
     return [mapRowToProduct(product)];
 };
@@ -307,7 +390,7 @@ const bulkUploadProducts = async (req, res) => {
             console.log(`[Bulk Upload] Processing: ${file.originalname} | isPDF: ${isPDF}`);
 
             if (isPDF) {
-                const products = await extractFromPDF(file.buffer);
+                const products = await extractFromPDF(file.buffer, file.originalname);
                 console.log(`[Bulk Upload] ${file.originalname} → ${products.length} product(s)`);
                 allFormattedProducts.push(...products);
             } else {
