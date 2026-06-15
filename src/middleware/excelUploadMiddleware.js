@@ -1,27 +1,29 @@
 const multer = require('multer');
 
-// Use memory storage for Excel files since we only need to parse them in memory
 const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
-    // Check for excel memetypes
-    if (
-        file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || 
-        file.mimetype === 'application/vnd.ms-excel' ||
-        file.originalname.endsWith('.xlsx') || 
-        file.originalname.endsWith('.xls') ||
-        file.originalname.endsWith('.csv')
-    ) {
+    const allowed = [
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.ms-excel',
+        'text/csv',
+        'application/csv',
+        'application/pdf',
+    ];
+    const allowedExts = ['.xlsx', '.xls', '.csv', '.pdf'];
+    const ext = '.' + file.originalname.split('.').pop().toLowerCase();
+
+    if (allowed.includes(file.mimetype) || allowedExts.includes(ext)) {
         cb(null, true);
     } else {
-        cb(new Error('Only Excel/CSV files are allowed!'), false);
+        cb(new Error('Only Excel, CSV, or PDF files are allowed!'), false);
     }
 };
 
-const excelUpload = multer({ 
-    storage: storage,
-    fileFilter: fileFilter,
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+const excelUpload = multer({
+    storage,
+    fileFilter,
+    limits: { fileSize: 20 * 1024 * 1024 }, // 20MB per file
 });
 
 module.exports = excelUpload;
