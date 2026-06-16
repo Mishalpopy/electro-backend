@@ -2,6 +2,11 @@ const productService = require('../services/productService');
 const Product = require('../models/ProductModel');
 const Brand = require('../models/BrandModel');
 const xlsx = require('xlsx');
+const { OpenAI } = require('openai');
+const { pdfToPng } = require('pdf-to-png-converter');
+const { Jimp } = require('jimp');
+const path = require('path');
+const fs = require('fs');
 
 // pdf-parse v1.x exports a simple async function: pdfParse(buffer) -> { text, ... }
 const pdfParse = require('pdf-parse');
@@ -37,13 +42,26 @@ const FIELD_MAP = {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-const normalise = (str) => String(str).toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+const clean = (str) => String(str).toLowerCase().replace(/[^a-z0-9]/g, '');
 
 const matchField = (header) => {
-    const h = normalise(header);
+    const hClean = clean(header);
+    if (!hClean) return null;
+
+    // Pass 1: Exact matches (ignoring spaces/special characters)
     for (const [field, aliases] of Object.entries(FIELD_MAP)) {
         for (const alias of aliases) {
-            if (normalise(alias) === h || h.includes(normalise(alias)) || normalise(alias).includes(h)) {
+            if (clean(alias) === hClean) {
+                return field;
+            }
+        }
+    }
+
+    // Pass 2: Substring matches (e.g. 'battery capacity' containing 'capacity')
+    for (const [field, aliases] of Object.entries(FIELD_MAP)) {
+        for (const alias of aliases) {
+            const aClean = clean(alias);
+            if (aClean.includes(hClean) || hClean.includes(aClean)) {
                 return field;
             }
         }
@@ -100,6 +118,167 @@ const mapRowToProduct = (row, batteryIconUrl = BATTERY_ICON) => {
         image,
         images,
     };
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PDF Extractor with AI (OpenAI Vision) & Jimp Image Cropper
+// ─────────────────────────────────────────────────────────────────────────────
+const extractFromPDFWithAI = async (pdfBuffer, filename = '', protocol = 'http', host = 'localhost') => {
+    console.log(`[AI PDF] Starting AI-based extraction for: ${filename}, buffer size: ${pdfBuffer.length}`);
+
+    // 1. Convert PDF's first page to a PNG buffer
+    const pngPages = await pdfToPng(pdfBuffer, {
+        viewportScale: 2.0,
+        pagesToProcess: [1]
+    });
+
+    if (!pngPages || pngPages.length === 0) {
+        throw new Error('Failed to render PDF page to PNG image buffer');
+    }
+
+    const pagePngBuffer = pngPages[0].content;
+    const base64Image = pagePngBuffer.toString('base64');
+
+    // 2. Initialize OpenAI client
+    const openai = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY
+    });
+
+    console.log('[AI PDF] Sending page image to OpenAI Vision API...');
+
+    // 3. Make chat completion call to GPT-4o
+    const response = await openai.chat.completions.create({
+        model: "gpt-4o",
+        response_format: { type: "json_object" },
+        messages: [
+            {
+                role: "user",
+                content: [
+                    {
+                        type: "text",
+                        text: `Analyze this image of a product specification sheet for a battery. 
+Please extract the following information and output it strictly as a JSON object:
+{
+  "brand": "The battery brand (e.g. Energizer, Bosch, Solite)",
+  "name": "The full product name (e.g. Energizer EP100L5)",
+  "part_number": "The model or part number of the battery (e.g. EP100L5H)",
+  "description": "A brief description (e.g. DIN100 - MF60044 or other key details)",
+  "capacity": "Capacity value (e.g. 100 Ah)",
+  "voltage": "Nominal voltage (e.g. 12 V)",
+  "battery_type": "Chemistry or type (e.g. Flooded / SLI, AGM, Gel, etc.)",
+  "ah": "Ampere Hour rating as a number or string (e.g. 100)",
+  "cca": "Cold Cranking Amps rating (e.g. 850 A)",
+  "dimensions": "Overall dimensions (e.g. 353x175x190 mm)",
+  "crop_box": {
+    "x": "The starting X coordinate of the battery/product picture as a percentage of page width (0 to 100)",
+    "y": "The starting Y coordinate of the battery/product picture as a percentage of page height (0 to 100)",
+    "width": "The width of the battery/product picture as a percentage of page width (0 to 100)",
+    "height": "The height of the battery/product picture as a percentage of page height (0 to 100)"
+  }
+}
+
+Important details:
+- Make sure to locate the actual physical photo of the battery product on the page to provide the crop_box coordinates.
+- If no battery photo is found, omit or set the crop_box to null.`
+                    },
+                    {
+                        type: "image_url",
+                        image_url: {
+                            url: `data:image/png;base64,${base64Image}`
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+
+    const resultText = response.choices[0].message.content;
+    console.log('[AI PDF] OpenAI Response received:', resultText);
+
+    let parsedResult;
+    try {
+        parsedResult = JSON.parse(resultText);
+    } catch (parseErr) {
+        throw new Error(`Failed to parse OpenAI JSON response: ${parseErr.message}`);
+    }
+
+    // Default icon if image fails
+    let finalImageUrl = `${protocol}://${host}/icons/eletro-battery-tile-1024.png`;
+
+    // 4. Crop the image using Jimp if crop_box coordinates are returned
+    if (parsedResult.crop_box && typeof parsedResult.crop_box === 'object') {
+        const { x, y, width: boxWidth, height: boxHeight } = parsedResult.crop_box;
+        
+        // Convert to numbers
+        const pctX = parseFloat(x);
+        const pctY = parseFloat(y);
+        const pctW = parseFloat(boxWidth);
+        const pctH = parseFloat(boxHeight);
+
+        if (!isNaN(pctX) && !isNaN(pctY) && !isNaN(pctW) && !isNaN(pctH) && pctW > 1 && pctH > 1) {
+            try {
+                console.log('[AI PDF] Initializing Jimp to crop battery image...');
+                const image = await Jimp.read(pagePngBuffer);
+                const imgWidth = image.bitmap.width;
+                const imgHeight = image.bitmap.height;
+
+                // Calculate absolute coordinates
+                const cropX = Math.round((pctX / 100) * imgWidth);
+                const cropY = Math.round((pctY / 100) * imgHeight);
+                const cropW = Math.round((pctW / 100) * imgWidth);
+                const cropH = Math.round((pctH / 100) * imgHeight);
+
+                // Ensure coordinates are within image boundaries
+                const safeX = Math.max(0, Math.min(cropX, imgWidth - 1));
+                const safeY = Math.max(0, Math.min(cropY, imgHeight - 1));
+                const safeW = Math.max(1, Math.min(cropW, imgWidth - safeX));
+                const safeH = Math.max(1, Math.min(cropH, imgHeight - safeY));
+
+                console.log(`[AI PDF] Cropping: x=${safeX}, y=${safeY}, w=${safeW}, h=${safeH} | Original: ${imgWidth}x${imgHeight}`);
+                
+                image.crop({ x: safeX, y: safeY, w: safeW, h: safeH });
+
+                // Ensure static uploads folder exists
+                const uploadDir = path.join(__dirname, '../uploads');
+                if (!fs.existsSync(uploadDir)) {
+                    fs.mkdirSync(uploadDir, { recursive: true });
+                }
+
+                // Save image
+                const uniqueFilename = `battery-ai-${Date.now()}-${Math.round(Math.random() * 1E9)}.png`;
+                const savePath = path.join(uploadDir, uniqueFilename);
+                await image.write(savePath);
+
+                finalImageUrl = `${protocol}://${host}/uploads/${uniqueFilename}`;
+                console.log(`[AI PDF] Cropped image saved successfully to: ${savePath}`);
+            } catch (jimpErr) {
+                console.error('[AI PDF] Jimp cropping failed, using default battery icon:', jimpErr.message);
+            }
+        }
+    }
+
+    // 5. Format product object for database insertion
+    const product = {
+        brand:        parsedResult.brand || '-',
+        name:         parsedResult.name || '-',
+        description:  parsedResult.description || '-',
+        price:        parsedResult.price ? Number(parsedResult.price) : 0,
+        warranty:     parsedResult.warranty || '-',
+        capacity:     parsedResult.capacity || '-',
+        voltage:      parsedResult.voltage || '-',
+        battery_type: parsedResult.battery_type || '-',
+        ah:           parsedResult.ah ? String(parsedResult.ah) : '-',
+        cca:          parsedResult.cca ? String(parsedResult.cca) : '-',
+        dimensions:   parsedResult.dimensions || '-',
+        part_number:  parsedResult.part_number || '-',
+        stock_status: parsedResult.stock_status || 'In Stock',
+        type:         parsedResult.type || 'battery',
+        is_favorite:  false,
+        image:        finalImageUrl,
+        images:       []
+    };
+
+    return [product];
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,13 +397,13 @@ const extractFromPDF = async (buffer, filename = '', batteryIconUrl = BATTERY_IC
     const product = {};
 
     // ── Strategy 1: Table mode (header row with 2+ field aliases) ────────────
-    const ALIAS_WORDS = Object.values(FIELD_MAP).flat().map(normalise);
+    const ALIAS_WORDS = Object.values(FIELD_MAP).flat().map(clean);
     let headerLineIdx = -1;
     let headerFields = [];
 
     for (let i = 0; i < Math.min(lines.length, 30); i++) {
         const parts = lines[i].split(/\t| {3,}|\|/).map(p => p.trim()).filter(Boolean);
-        const matches = parts.filter(p => ALIAS_WORDS.some(a => normalise(p) === a || normalise(p).includes(a)));
+        const matches = parts.filter(p => ALIAS_WORDS.some(a => clean(p) === a || clean(p).includes(a) || a.includes(clean(p))));
         if (matches.length >= 2) {
             headerLineIdx = i;
             headerFields = parts.map(p => matchField(p) || p);
@@ -393,7 +572,19 @@ const bulkUploadProducts = async (req, res) => {
             console.log(`[Bulk Upload] Processing: ${file.originalname} | isPDF: ${isPDF}`);
 
             if (isPDF) {
-                const products = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
+                let products;
+                if (process.env.OPENAI_API_KEY) {
+                    try {
+                        console.log(`[Bulk Upload] Using OpenAI Vision parser for: ${file.originalname}`);
+                        products = await extractFromPDFWithAI(file.buffer, file.originalname, protocol, host);
+                    } catch (aiErr) {
+                        console.error(`[Bulk Upload] OpenAI Vision failed, falling back to legacy parser: ${aiErr.message}`);
+                        products = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
+                    }
+                } else {
+                    console.log(`[Bulk Upload] OpenAI API key not found, using legacy parser for: ${file.originalname}`);
+                    products = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
+                }
                 console.log(`[Bulk Upload] ${file.originalname} → ${products.length} product(s)`);
                 allFormattedProducts.push(...products);
             } else {
