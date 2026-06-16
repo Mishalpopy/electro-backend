@@ -700,17 +700,33 @@ const bulkUploadProducts = async (req, res) => {
 
             if (isPDF) {
                 let products;
-                if (process.env.OPENAI_API_KEY) {
+                const legacyProducts = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
+                
+                // Get page count
+                let numPages = 1;
+                try {
+                    const parsedData = await pdfParse(file.buffer);
+                    numPages = parsedData.numpages || 1;
+                } catch (err) {
+                    console.error('[Bulk Upload] Failed to count PDF pages:', err.message);
+                }
+
+                // If it contains multiple pages OR legacy parser already found more than 1 product,
+                // bypass OpenAI Vision since it's a multi-product sheet / catalog
+                if (numPages > 1 || legacyProducts.length > 1) {
+                    console.log(`[Bulk Upload] Multi-page (${numPages} pages) or multi-product list (${legacyProducts.length} items) detected. Using legacy text parser for: ${file.originalname}`);
+                    products = legacyProducts;
+                } else if (process.env.OPENAI_API_KEY) {
                     try {
-                        console.log(`[Bulk Upload] Using OpenAI Vision parser for: ${file.originalname}`);
+                        console.log(`[Bulk Upload] Single-page, single-product sheet. Using OpenAI Vision parser for: ${file.originalname}`);
                         products = await extractFromPDFWithAI(file.buffer, file.originalname, protocol, host);
                     } catch (aiErr) {
                         console.error(`[Bulk Upload] OpenAI Vision failed, falling back to legacy parser: ${aiErr.message}`);
-                        products = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
+                        products = legacyProducts;
                     }
                 } else {
                     console.log(`[Bulk Upload] OpenAI API key not found, using legacy parser for: ${file.originalname}`);
-                    products = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
+                    products = legacyProducts;
                 }
                 console.log(`[Bulk Upload] ${file.originalname} → ${products.length} product(s)`);
                 allFormattedProducts.push(...products);
