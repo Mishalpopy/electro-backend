@@ -631,6 +631,40 @@ const extractFromPDF = async (buffer, filename = '', batteryIconUrl = BATTERY_IC
     if (!product.cca)      { const m = fullText.match(/(\d{3,})\s*A\b/); if (m) product.cca      = `${m[1]} A`; }
     if (!product.capacity) product.capacity = product.ah || '-';
 
+    // If we haven't extracted any products via lists/tables, try extracting via DIN/JIS regexes (useful for guides/spec sheets listing multiple part numbers)
+    const dinRegex = /DIN\d{2,3}[H|L]?/gi;
+    const jisRegex = /\b\d{2,3}[A-Z]\d{2}[R|L]?\b/gi;
+
+    const matchedParts = new Set();
+    let rMatch;
+    while ((rMatch = dinRegex.exec(fullText)) !== null) {
+        matchedParts.add(rMatch[0].toUpperCase());
+    }
+    while ((rMatch = jisRegex.exec(fullText)) !== null) {
+        matchedParts.add(rMatch[0].toUpperCase());
+    }
+
+    if (matchedParts.size > 0) {
+        const finalBrand = filenameBrand || textBrand || product.brand || 'Unknown';
+        const regexProducts = Array.from(matchedParts).map(part => {
+            return {
+                brand: finalBrand,
+                part_number: part,
+                name: `${finalBrand} ${part}`,
+                price: 0,
+                voltage: '12 V',
+                battery_type: part.startsWith('DIN') ? 'Flooded / DIN' : 'Flooded / JIS',
+                description: `${finalBrand} Battery | Part: ${part}`,
+                stock_status: 'In Stock',
+                type: 'battery',
+                image: batteryIconUrl,
+                images: []
+            };
+        });
+        console.log(`[PDF] DIN/JIS regex extraction matched! Extracted ${regexProducts.length} products.`);
+        return regexProducts;
+    }
+
     console.log('[PDF] Final product:', JSON.stringify(product, null, 2));
     return [mapRowToProduct(product)];
 };
@@ -702,24 +736,21 @@ const bulkUploadProducts = async (req, res) => {
                 let products;
                 const legacyProducts = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
                 
-                // Get page count
-                let numPages = 1;
-                try {
-                    const parsedData = await pdfParse(file.buffer);
-                    numPages = parsedData.numpages || 1;
-                } catch (err) {
-                    console.error('[Bulk Upload] Failed to count PDF pages:', err.message);
-                }
-
-                // If it contains multiple pages OR legacy parser already found more than 1 product,
-                // bypass OpenAI Vision since it's a multi-product sheet / catalog
-                if (numPages > 1 || legacyProducts.length > 1) {
-                    console.log(`[Bulk Upload] Multi-page (${numPages} pages) or multi-product list (${legacyProducts.length} items) detected. Using legacy text parser for: ${file.originalname}`);
+                // If the legacy parser extracted more than 1 product, it's a text-based multi-product sheet/price-list
+                if (legacyProducts.length > 1) {
+                    console.log(`[Bulk Upload] Multi-product price-list detected (${legacyProducts.length} items). Using legacy text parser for: ${file.originalname}`);
                     products = legacyProducts;
                 } else if (process.env.OPENAI_API_KEY) {
                     try {
-                        console.log(`[Bulk Upload] Single-page, single-product sheet. Using OpenAI Vision parser for: ${file.originalname}`);
+                        console.log(`[Bulk Upload] Attempting OpenAI Vision parser for: ${file.originalname}`);
                         products = await extractFromPDFWithAI(file.buffer, file.originalname, protocol, host);
+                        
+                        // If OpenAI Vision skipped it (e.g. general brochure/guide) and returned 0 products, 
+                        // fallback to whatever the legacy parser could extract (usually 0 or 1 product)
+                        if (products.length === 0) {
+                            console.log(`[Bulk Upload] OpenAI Vision skipped product. Falling back to legacy parser results: ${file.originalname}`);
+                            products = legacyProducts;
+                        }
                     } catch (aiErr) {
                         console.error(`[Bulk Upload] OpenAI Vision failed, falling back to legacy parser: ${aiErr.message}`);
                         products = legacyProducts;
@@ -739,22 +770,65 @@ const bulkUploadProducts = async (req, res) => {
             }
         }
 
+        // Clean up and filter out empty/invalid products
+        allFormattedProducts = allFormattedProducts.filter(p => {
+            const hasBrand = p.brand && p.brand !== '-' && p.brand.trim() !== '';
+            const hasName = p.name && p.name !== '-' && p.name.trim() !== '';
+            const hasPartNum = p.part_number && p.part_number !== '-' && p.part_number.trim() !== '';
+            return hasBrand || hasName || hasPartNum;
+        });
+
         if (allFormattedProducts.length === 0) {
             return res.status(400).json({ status: false, message: 'Could not extract any products from the uploaded files.' });
         }
 
-        // Auto-create brand if it doesn't exist in the list
+        // Auto-create brand if it doesn't exist in the list, or fetch its image if it uses the default icon
         const brandNames = [...new Set(allFormattedProducts.map(p => p.brand).filter(b => b && typeof b === 'string' && b.trim() !== '' && b.trim() !== '-'))];
+        
         for (const brandName of brandNames) {
             const trimmedName = brandName.trim();
-            const brandExists = await Brand.findOne({ name: { $regex: new RegExp(`^${trimmedName}$`, 'i') } });
-            if (!brandExists) {
+            let brandDoc = await Brand.findOne({ name: { $regex: new RegExp(`^${trimmedName}$`, 'i') } });
+            
+            let brandImageUrl = currentBatteryIconUrl;
+            
+            // Check if brand doc needs a custom image (doesn't exist, or exists but uses the default icon)
+            const needsCustomImage = !brandDoc || !brandDoc.image || brandDoc.image.includes('/icons/eletro-battery-tile');
+            
+            if (needsCustomImage) {
+                console.log(`[Bulk Upload] Brand "${trimmedName}" needs a custom image. Searching DDG for brand battery image...`);
+                try {
+                    const searchFilename = await getSearchProductImage(trimmedName, trimmedName, '');
+                    if (searchFilename) {
+                        brandImageUrl = `${protocol}://${host}/uploads/${searchFilename}`;
+                        console.log(`[Bulk Upload] Found brand battery image for "${trimmedName}":`, brandImageUrl);
+                    }
+                } catch (searchErr) {
+                    console.error(`[Bulk Upload] Brand image search failed for "${trimmedName}":`, searchErr.message);
+                }
+            } else if (brandDoc) {
+                brandImageUrl = brandDoc.image;
+            }
+
+            if (!brandDoc) {
                 console.log(`[Bulk Upload] Brand "${trimmedName}" not on the list. Auto-creating...`);
-                await Brand.create({
+                brandDoc = await Brand.create({
                     name: trimmedName,
-                    image: currentBatteryIconUrl,
+                    image: brandImageUrl,
                     status: 'active'
                 });
+            } else if (needsCustomImage && brandImageUrl !== currentBatteryIconUrl) {
+                console.log(`[Bulk Upload] Updating brand "${trimmedName}" image with custom image...`);
+                brandDoc.image = brandImageUrl;
+                await brandDoc.save();
+            }
+
+            // Assign brandImageUrl to any products of this brand that currently have the default icon
+            for (const p of allFormattedProducts) {
+                if (p.brand && p.brand.trim().toLowerCase() === trimmedName.toLowerCase()) {
+                    if (!p.image || p.image.includes('/icons/eletro-battery-tile')) {
+                        p.image = brandImageUrl;
+                    }
+                }
             }
         }
 

@@ -69,6 +69,10 @@ const productSchema = new mongoose.Schema({
         default: 'In Stock',
         enum: ['In Stock', 'Out of Stock'],
     },
+    stock: {
+        type: Number,
+        default: () => Math.floor(Math.random() * 701) + 300,
+    },
     is_favorite: {
         type: Boolean,
         default: false,
