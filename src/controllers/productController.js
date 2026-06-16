@@ -121,6 +121,99 @@ const mapRowToProduct = (row, batteryIconUrl = BATTERY_ICON) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DuckDuckGo Image Search & Download Helper
+// ─────────────────────────────────────────────────────────────────────────────
+const searchDuckDuckGoImages = async (query) => {
+    console.log('[Image Search] Querying DDG for:', query);
+    try {
+        const response = await fetch(`https://duckduckgo.com/?q=${encodeURIComponent(query)}`);
+        const html = await response.text();
+        
+        // Extract VQD using a regex
+        const vqdMatch = html.match(/vqd=['"]?([\d-]+)['"]?/);
+        if (!vqdMatch) throw new Error("Could not extract VQD token");
+        const vqd = vqdMatch[1];
+
+        // Fetch image results using the VQD
+        const searchUrl = new URL("https://duckduckgo.com/i.js");
+        searchUrl.searchParams.append("l", "wt-wt");
+        searchUrl.searchParams.append("o", "json");
+        searchUrl.searchParams.append("q", query);
+        searchUrl.searchParams.append("vqd", vqd);
+        searchUrl.searchParams.append("f", ",,,");
+        searchUrl.searchParams.append("p", "1");
+
+        const imageResponse = await fetch(searchUrl);
+        const data = await imageResponse.json();
+        
+        return data.results || [];
+    } catch (err) {
+        console.error('[Image Search] Error searching DuckDuckGo:', err.message);
+        return [];
+    }
+};
+
+const getSearchProductImage = async (brand, name, partNumber) => {
+    const query = `${brand} ${partNumber || name} battery`;
+    const results = await searchDuckDuckGoImages(query);
+    
+    if (!results || results.length === 0) {
+        console.log('[Image Search] No results found for:', query);
+        return null;
+    }
+
+    // Try fetching from the first few image results
+    for (let i = 0; i < Math.min(results.length, 5); i++) {
+        const imageUrl = results[i].image;
+        console.log(`[Image Search] Attempting download ${i + 1}/${Math.min(results.length, 5)}: ${imageUrl}`);
+        
+        try {
+            const res = await fetch(imageUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                },
+                signal: AbortSignal.timeout(5000) // 5s timeout
+            });
+
+            if (!res.ok) {
+                console.log(`[Image Search] Download failed: HTTP ${res.status}`);
+                continue;
+            }
+
+            const arrayBuffer = await res.arrayBuffer();
+            const imageBuffer = Buffer.from(arrayBuffer);
+
+            console.log('[Image Search] Image downloaded. Processing with Jimp...');
+            const img = await Jimp.read(imageBuffer);
+            
+            // Pad to a square transparent canvas
+            const maxDim = Math.max(img.bitmap.width, img.bitmap.height);
+            const squareImage = new Jimp({ width: maxDim, height: maxDim });
+            const posX = Math.round((maxDim - img.bitmap.width) / 2);
+            const posY = Math.round((maxDim - img.bitmap.height) / 2);
+            squareImage.composite(img, posX, posY);
+
+            // Ensure static uploads folder exists
+            const uploadDir = path.join(__dirname, '../uploads');
+            if (!fs.existsSync(uploadDir)) {
+                fs.mkdirSync(uploadDir, { recursive: true });
+            }
+
+            const uniqueFilename = `battery-search-${Date.now()}-${Math.round(Math.random() * 1E9)}.png`;
+            const savePath = path.join(uploadDir, uniqueFilename);
+            await squareImage.write(savePath);
+
+            console.log(`[Image Search] Saved square image successfully to: ${savePath}`);
+            return uniqueFilename;
+        } catch (err) {
+            console.error(`[Image Search] Error downloading result ${i + 1}:`, err.message);
+        }
+    }
+    
+    return null;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PDF Extractor with AI (OpenAI Vision) & Jimp Image Cropper
 // ─────────────────────────────────────────────────────────────────────────────
 const extractFromPDFWithAI = async (pdfBuffer, filename = '', protocol = 'http', host = 'localhost') => {
@@ -170,15 +263,21 @@ Please extract the following information and output it strictly as a JSON object
   "cca": "Cold Cranking Amps rating (e.g. 850 A)",
   "dimensions": "Overall dimensions (e.g. 353x175x190 mm)",
   "crop_box": {
-    "x": "The starting X coordinate of the battery/product picture as a percentage of page width (0 to 100)",
-    "y": "The starting Y coordinate of the battery/product picture as a percentage of page height (0 to 100)",
-    "width": "The width of the battery/product picture as a percentage of page width (0 to 100)",
-    "height": "The height of the battery/product picture as a percentage of page height (0 to 100)"
+    "x": "The starting X coordinate of ONLY the physical battery body/product as a percentage of page width (0 to 100)",
+    "y": "The starting Y coordinate of ONLY the physical battery body/product as a percentage of page height (0 to 100)",
+    "width": "The width of ONLY the physical battery body/product as a percentage of page width (0 to 100)",
+    "height": "The height of ONLY the physical battery body/product as a percentage of page height (0 to 100)"
   }
 }
 
-Important details:
-- Make sure to locate the actual physical photo of the battery product on the page to provide the crop_box coordinates.
+Important details for crop_box:
+- The specification sheet has a header banner at the top (occupying roughly the top 12% of the page).
+- Inside this top header, there are battery images located in the center-right section (around X = 48% to 62%, and Y = 3% to 11%).
+- Your crop_box coordinates must be extremely tight around ONLY these physical battery objects (specifically the larger battery on the right, or both together if they are adjacent).
+- DO NOT crop the "Energizer" logo on the far left of the header.
+- DO NOT include the red background wedge/banner on the right side of the batteries.
+- DO NOT include the red horizontal "Product Data Sheet" banner or stripe below the header.
+- The crop box should start at the very top of the battery handle/terminals and end at the bottom edge of the battery's black base.
 - If no battery photo is found, omit or set the crop_box to null.`
                     },
                     {
@@ -204,9 +303,29 @@ Important details:
 
     // Default icon if image fails
     let finalImageUrl = `${protocol}://${host}/icons/eletro-battery-tile-1024.png`;
+    let imageSaved = false;
 
-    // 4. Crop the image using Jimp if crop_box coordinates are returned
-    if (parsedResult.crop_box && typeof parsedResult.crop_box === 'object') {
+    // 4. Try to search and download product image online first
+    if (parsedResult.brand && (parsedResult.part_number || parsedResult.name)) {
+        try {
+            console.log('[AI PDF] Searching for product image online...');
+            const searchFilename = await getSearchProductImage(
+                parsedResult.brand,
+                parsedResult.name,
+                parsedResult.part_number
+            );
+            if (searchFilename) {
+                finalImageUrl = `${protocol}://${host}/uploads/${searchFilename}`;
+                imageSaved = true;
+                console.log('[AI PDF] Online image search & download succeeded. URL:', finalImageUrl);
+            }
+        } catch (searchErr) {
+            console.error('[AI PDF] Online image search/download failed:', searchErr.message);
+        }
+    }
+
+    // 5. If online search failed, crop the image using Jimp from PDF (OpenAI Vision fallback)
+    if (!imageSaved && parsedResult.crop_box && typeof parsedResult.crop_box === 'object') {
         const { x, y, width: boxWidth, height: boxHeight } = parsedResult.crop_box;
         
         // Convert to numbers
@@ -217,7 +336,7 @@ Important details:
 
         if (!isNaN(pctX) && !isNaN(pctY) && !isNaN(pctW) && !isNaN(pctH) && pctW > 1 && pctH > 1) {
             try {
-                console.log('[AI PDF] Initializing Jimp to crop battery image...');
+                console.log('[AI PDF] Initializing Jimp to crop battery image as fallback...');
                 const image = await Jimp.read(pagePngBuffer);
                 const imgWidth = image.bitmap.width;
                 const imgHeight = image.bitmap.height;
@@ -238,26 +357,34 @@ Important details:
                 
                 image.crop({ x: safeX, y: safeY, w: safeW, h: safeH });
 
+                // Make the cropped image square by centering it on a transparent square canvas
+                const maxDim = Math.max(image.bitmap.width, image.bitmap.height);
+                const squareImage = new Jimp({ width: maxDim, height: maxDim });
+                const posX = Math.round((maxDim - image.bitmap.width) / 2);
+                const posY = Math.round((maxDim - image.bitmap.height) / 2);
+                squareImage.composite(image, posX, posY);
+
                 // Ensure static uploads folder exists
                 const uploadDir = path.join(__dirname, '../uploads');
                 if (!fs.existsSync(uploadDir)) {
                     fs.mkdirSync(uploadDir, { recursive: true });
                 }
 
-                // Save image
+                // Save square image
                 const uniqueFilename = `battery-ai-${Date.now()}-${Math.round(Math.random() * 1E9)}.png`;
                 const savePath = path.join(uploadDir, uniqueFilename);
-                await image.write(savePath);
+                await squareImage.write(savePath);
 
                 finalImageUrl = `${protocol}://${host}/uploads/${uniqueFilename}`;
-                console.log(`[AI PDF] Cropped image saved successfully to: ${savePath}`);
+                imageSaved = true;
+                console.log(`[AI PDF] Cropped square image saved successfully to: ${savePath}`);
             } catch (jimpErr) {
-                console.error('[AI PDF] Jimp cropping failed, using default battery icon:', jimpErr.message);
+                console.error('[AI PDF] Jimp cropping fallback failed, using default battery icon:', jimpErr.message);
             }
         }
     }
 
-    // 5. Format product object for database insertion
+    // 6. Format product object for database insertion
     const product = {
         brand:        parsedResult.brand || '-',
         name:         parsedResult.name || '-',
