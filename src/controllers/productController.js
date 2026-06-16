@@ -10,7 +10,7 @@ console.log('[pdf-parse] loaded, type:', typeof pdfParse);
 // ─────────────────────────────────────────────────────────────────────────────
 // BATTERY ICON — default image when none is found in the uploaded document
 // ─────────────────────────────────────────────────────────────────────────────
-const BATTERY_ICON = 'https://cdn-icons-png.flaticon.com/512/2933/2933245.png';
+const BATTERY_ICON = '/icons/eletro-battery-tile-1024.png';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FIELD MAP — all known aliases for each product field (case-insensitive)
@@ -51,7 +51,7 @@ const matchField = (header) => {
     return null;
 };
 
-const mapRowToProduct = (row) => {
+const mapRowToProduct = (row, batteryIconUrl = BATTERY_ICON) => {
     const normalised = {};
     for (const [key, val] of Object.entries(row)) {
         const field = matchField(key);
@@ -68,7 +68,7 @@ const mapRowToProduct = (row) => {
     const rawImage = normalised['image'];
     const image = (rawImage && String(rawImage).trim() !== '' && String(rawImage).trim() !== '-')
         ? String(rawImage).trim()
-        : BATTERY_ICON;
+        : batteryIconUrl;
 
     const rawImages = normalised['images'];
     const images = (rawImages && String(rawImages).trim() !== '' && String(rawImages).trim() !== '-')
@@ -105,7 +105,7 @@ const mapRowToProduct = (row) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // PDF Extractor — tuned for Energizer Product Sheet format
 // ─────────────────────────────────────────────────────────────────────────────
-const extractFromPDF = async (buffer, filename = '') => {
+const extractFromPDF = async (buffer, filename = '', batteryIconUrl = BATTERY_ICON) => {
     console.log('[PDF] Starting extraction, buffer size:', buffer.length);
     const data = await pdfParse(buffer);
     const fullText = data.text;
@@ -200,7 +200,7 @@ const extractFromPDF = async (buffer, filename = '') => {
                     description: `${foundBrand} Battery | Part: ${partNumRaw} | Capacity: ${afterBrandRaw || ah}`,
                     stock_status: 'In Stock',
                     type: 'battery',
-                    image: BATTERY_ICON,
+                    image: batteryIconUrl,
                     images: []
                 };
 
@@ -383,6 +383,9 @@ const bulkUploadProducts = async (req, res) => {
         console.log(`[Bulk Upload] ${files.length} file(s) received`);
 
         let allFormattedProducts = [];
+        const protocol = req.protocol;
+        const host = req.get('host');
+        const currentBatteryIconUrl = `${protocol}://${host}/icons/eletro-battery-tile-1024.png`;
 
         for (const file of files) {
             const ext = file.originalname.split('.').pop().toLowerCase();
@@ -390,7 +393,7 @@ const bulkUploadProducts = async (req, res) => {
             console.log(`[Bulk Upload] Processing: ${file.originalname} | isPDF: ${isPDF}`);
 
             if (isPDF) {
-                const products = await extractFromPDF(file.buffer, file.originalname);
+                const products = await extractFromPDF(file.buffer, file.originalname, currentBatteryIconUrl);
                 console.log(`[Bulk Upload] ${file.originalname} → ${products.length} product(s)`);
                 allFormattedProducts.push(...products);
             } else {
@@ -398,7 +401,7 @@ const bulkUploadProducts = async (req, res) => {
                 const sheetName = workbook.SheetNames[0];
                 const rows = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
                 console.log(`[Bulk Upload] ${file.originalname} → ${rows.length} row(s)`);
-                if (rows.length > 0) allFormattedProducts.push(...rows.map(mapRowToProduct));
+                if (rows.length > 0) allFormattedProducts.push(...rows.map(row => mapRowToProduct(row, currentBatteryIconUrl)));
             }
         }
 
@@ -415,7 +418,7 @@ const bulkUploadProducts = async (req, res) => {
                 console.log(`[Bulk Upload] Brand "${trimmedName}" not on the list. Auto-creating...`);
                 await Brand.create({
                     name: trimmedName,
-                    image: BATTERY_ICON,
+                    image: currentBatteryIconUrl,
                     status: 'active'
                 });
             }

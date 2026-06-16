@@ -48,6 +48,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Serve static files from the uploads directory
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/icons', express.static(path.join(__dirname, '../icons')));
 
 // Simple request logger and Security Headers
 app.use((req, res, next) => {

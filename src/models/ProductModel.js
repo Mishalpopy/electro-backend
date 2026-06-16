@@ -26,7 +26,7 @@ const productSchema = new mongoose.Schema({
     },
     image: {
         type: String, // main/thumbnail image
-        default: 'https://placehold.co/400x400',
+        default: '/icons/eletro-battery-tile-1024.png',
     },
     images: {
         type: [String], // array of image urls
